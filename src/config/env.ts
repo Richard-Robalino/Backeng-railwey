@@ -20,11 +20,8 @@ BASE_URL: process.env.BASE_URL ?? `http://localhost:${Number(process.env.PORT ??
   SESSION_INACTIVITY_MIN: Number(required('SESSION_INACTIVITY_MIN', '20')),
   RATE_LIMIT_WINDOW_MIN: Number(required('RATE_LIMIT_WINDOW_MIN', '15')),
   RATE_LIMIT_MAX: Number(required('RATE_LIMIT_MAX', '100')),
-  SMTP_HOST: required('SMTP_HOST'),
-  SMTP_PORT: Number(required('SMTP_PORT', '587')),
-  SMTP_SECURE: (process.env.SMTP_SECURE ?? 'false') === 'true',
-  SMTP_USER: required('SMTP_USER'),
-  SMTP_PASS: required('SMTP_PASS'),
-  EMAIL_FROM: required('EMAIL_FROM'),
+  RESEND_API_KEY: required("RESEND_API_KEY"),
+  EMAIL_FROM: required("EMAIL_FROM"),
+  EMAIL_REPLY_TO: process.env.EMAIL_REPLY_TO,
   GOOGLE_CLIENT_ID: required('GOOGLE_CLIENT_ID')
 };
