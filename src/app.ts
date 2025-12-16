@@ -11,6 +11,8 @@ import { errorHandler, notFoundHandler } from './middlewares/errorHandler.js';
 import routerV1 from './routes.js';
 
 const app = express();
+// detrás de un proxy (Railway/Render/Heroku/Nginx)
+app.set('trust proxy', 1);
 
 // Security & parsing
 app.use(helmet());
@@ -43,10 +45,9 @@ const apiLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false
 });
-app.use('/api', apiLimiter);
-
-// Versioned routes
+app.use('/api/v1', apiLimiter);
 app.use('/api/v1', routerV1);
+
 
 // 404 & error
 app.use(notFoundHandler);
