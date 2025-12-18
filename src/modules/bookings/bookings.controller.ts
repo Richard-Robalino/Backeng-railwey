@@ -27,13 +27,18 @@ function hoursUntil(now: Date, future: Date) {
   return (future.getTime() - now.getTime()) / 36e5;
 }
 
-// --- Estados activos de reservas y citas manuales ---
+/**
+ * Estados que BLOQUEAN horarios (para evitar solapes)
+ * Incluye legacy por si hay docs viejos.
+ */
 const ACTIVE_BOOKING_STATES = [
-  BOOKING_STATUS.SCHEDULED,
   BOOKING_STATUS.CONFIRMED,
   BOOKING_STATUS.IN_PROGRESS,
+
+  // legacy / compat
+  BOOKING_STATUS.SCHEDULED,
   BOOKING_STATUS.PENDING_STYLIST_CONFIRMATION
-];
+].filter(Boolean);
 
 const ACTIVE_APPOINTMENT_STATES = ['PENDIENTE', 'CONFIRMADA'] as const;
 
@@ -48,20 +53,14 @@ const WEEKDAYS = [
   'SABADO'
 ] as const;
 
-type Weekday = typeof WEEKDAYS[number];
-
 const TZ = 'America/Guayaquil';
 
-
-
 function getDayLabelEC(dateStr: string) {
-  const d = dayjs.tz(dateStr, 'YYYY-MM-DD', TZ); // ✅ correcto
+  const d = dayjs.tz(dateStr, 'YYYY-MM-DD', TZ);
   return WEEKDAYS[d.day()];
 }
 
-
 // --- Overlap con citas MANUALES (appointments) ---
-
 async function hasManualAppointmentOverlapForStylist(
   stylistId: string,
   start: Date,
@@ -100,7 +99,7 @@ export async function getAvailability(req: Request, res: Response, next: NextFun
 }
 
 // ---------------------------------------------------------------------
-// CREAR RESERVA (1 o varios slots)
+// CREAR RESERVA (1 o varios slots)  -> estado: CONFIRMED
 // ---------------------------------------------------------------------
 export async function createBooking(req: Request, res: Response, next: NextFunction) {
   try {
@@ -118,7 +117,7 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
       throw new ApiError(StatusCodes.FORBIDDEN, 'Cuenta temporalmente bloqueada para reservas');
     }
 
-    // 2) Normalizar lista de slots (1 o varios)
+    // 2) Normalizar lista de slots
     let slotIdList: string[] = [];
     if (Array.isArray(slotIds) && slotIds.length > 0) {
       slotIdList = slotIds;
@@ -133,10 +132,7 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
 
     const invalid = uniqueSlotIds.filter(id => !mongoose.isValidObjectId(id));
     if (invalid.length) {
-      throw new ApiError(
-        StatusCodes.BAD_REQUEST,
-        `slotIds inválidos: ${invalid.join(', ')}`
-      );
+      throw new ApiError(StatusCodes.BAD_REQUEST, `slotIds inválidos: ${invalid.join(', ')}`);
     }
 
     // 3) Buscar slots activos
@@ -148,10 +144,7 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
       .populate('service', 'nombre duracionMin precio activo');
 
     if (slots.length !== uniqueSlotIds.length) {
-      throw new ApiError(
-        StatusCodes.BAD_REQUEST,
-        'Uno o más horarios no existen o están inactivos'
-      );
+      throw new ApiError(StatusCodes.BAD_REQUEST, 'Uno o más horarios no existen o están inactivos');
     }
 
     // 4) Validar fecha (Ecuador)
@@ -160,7 +153,7 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
       throw new ApiError(StatusCodes.BAD_REQUEST, 'Fecha inválida');
     }
 
-    const dayLabel = getDayLabelEC(date); // ✅ ECUADOR
+    const dayLabel = getDayLabelEC(date);
 
     type Candidate = {
       slot: any;
@@ -192,7 +185,7 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
         );
       }
 
-      // ✅ Construcción Ecuador (00:00 Ecuador + minutos)
+      // ✅ Construcción Ecuador
       const start = buildDateTimeForSlot(date, slot.startMin);
       const end = buildDateTimeForSlot(date, slot.endMin);
 
@@ -264,7 +257,7 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
       }
     }
 
-    // 8) Crear todas las reservas
+    // 8) Crear todas las reservas -> CONFIRMED + clienteAsistio null
     const created: any[] = [];
     for (const c of candidates) {
       const booking = await BookingModel.create({
@@ -273,19 +266,22 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
         servicioId: c.slot.service._id,
         inicio: c.start,
         fin: c.end,
-        estado: BOOKING_STATUS.SCHEDULED,
+
+        estado: BOOKING_STATUS.CONFIRMED, // ✅ CAMBIO AQUÍ
+        clienteAsistio: null,
+
         notas,
         creadoPor: userId
       });
       created.push(booking);
     }
 
-    // 9) Notificar por correo a estilista(s) y cliente (hora Ecuador)
+    // 9) Correos
     const clientNombre =
       client ? `${client.nombre} ${client.apellido ?? ''}`.trim() : 'Cliente';
 
     for (const c of candidates) {
-      const fechaTexto = formatEC(c.start); // ✅ ECUADOR
+      const fechaTexto = formatEC(c.start);
       const servicioTexto = c.slot.service?.nombre ?? 'Servicio';
 
       const stylistUser = await UserModel.findById(c.slot.stylist._id);
@@ -313,7 +309,7 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
           `Fecha y hora: ${fechaTexto}\n\n` +
           `Notas: ${notas || 'Sin notas adicionales.'}`;
 
-        await sendEmail(client.email, 'Confirmación de reserva', bodyClient);
+        await sendEmail(client.email, 'Reserva confirmada', bodyClient);
       }
     }
 
@@ -326,7 +322,7 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
 }
 
 // ---------------------------------------------------------------------
-// REPROGRAMAR RESERVA
+// REPROGRAMAR RESERVA -> estado: CONFIRMED (sin confirmación del estilista)
 // ---------------------------------------------------------------------
 export async function rescheduleBooking(req: Request, res: Response, next: NextFunction) {
   try {
@@ -337,9 +333,8 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
     if (!booking) throw new ApiError(StatusCodes.NOT_FOUND, 'No existe');
 
     const now = new Date();
-    const diffHours = hoursUntil(now, booking.inicio); // ✅ sin abs()
+    const diffHours = hoursUntil(now, booking.inicio);
 
-    // Regla: cliente no reprograma < 12h (y si ya pasó, también queda bloqueado)
     if (user.role === ROLES.CLIENTE && diffHours < 12) {
       throw new ApiError(
         StatusCodes.FORBIDDEN,
@@ -347,7 +342,7 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
       );
     }
 
-    const start = parseDateTime(req.body.inicio); // ✅ ECUADOR si viene sin zona
+    const start = parseDateTime(req.body.inicio);
     if (isNaN(start.getTime())) {
       throw new ApiError(StatusCodes.BAD_REQUEST, 'Fecha de inicio inválida');
     }
@@ -359,7 +354,6 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
 
     const end = dayjs(start).add(service.duracionMin, 'minute').toDate();
 
-    // 1) Reservas del estilista (otras)
     const overlapping = await BookingModel.exists({
       _id: { $ne: booking.id },
       estilistaId: booking.estilistaId,
@@ -369,7 +363,6 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
     });
     if (overlapping) throw new ApiError(StatusCodes.CONFLICT, 'Horario no disponible');
 
-    // 2) Citas manuales del estilista
     const manualStylist = await hasManualAppointmentOverlapForStylist(
       booking.estilistaId.toString(),
       start,
@@ -379,7 +372,6 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
       throw new ApiError(StatusCodes.CONFLICT, 'Horario no disponible (existe una cita manual para el estilista)');
     }
 
-    // 3) Citas manuales del cliente
     if (booking.clienteId) {
       const manualClient = await hasManualAppointmentOverlapForClient(
         booking.clienteId.toString(),
@@ -393,15 +385,17 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
 
     booking.inicio = start;
     booking.fin = end;
-    booking.estado = BOOKING_STATUS.PENDING_STYLIST_CONFIRMATION;
+
+    booking.estado = BOOKING_STATUS.CONFIRMED; // ✅ CAMBIO AQUÍ
+    booking.clienteAsistio = null;
+
     booking.actualizadoPor = user.id as any;
     await booking.save();
 
-    // --------- Enviar correos por reprogramación ---------
-    const fechaTexto = formatEC(start); // ✅ ARREGLADO (antes decía c.start)
+    // Correos
+    const fechaTexto = formatEC(start);
     const servicioTexto = service?.nombre ?? 'Servicio';
 
-    // Estilista
     const stylistUser = await UserModel.findById(booking.estilistaId).select('email nombre apellido');
     if (stylistUser?.email) {
       const bodyStylist =
@@ -413,7 +407,6 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
       await sendEmail(stylistUser.email, 'Reserva reprogramada', bodyStylist);
     }
 
-    // Cliente
     if (booking.clienteId) {
       const clientUser = await UserModel.findById(booking.clienteId).select('email nombre apellido');
       if (clientUser?.email) {
@@ -450,7 +443,7 @@ export async function cancelBooking(req: Request, res: Response, next: NextFunct
     if (!booking) throw new ApiError(StatusCodes.NOT_FOUND, 'No existe');
 
     const now = new Date();
-    const diffHours = hoursUntil(now, booking.inicio); // ✅ sin abs()
+    const diffHours = hoursUntil(now, booking.inicio);
 
     if (user.role === ROLES.CLIENTE) {
       if (diffHours < 12) {
@@ -472,43 +465,24 @@ export async function cancelBooking(req: Request, res: Response, next: NextFunct
 }
 
 // ---------------------------------------------------------------------
-// CONFIRMAR / COMPLETAR
+// FINALIZAR (ESTILISTA) -> marcar asistencia SI/NO
+// - true  => COMPLETED (puede guardar precio)
+// - false => NO_SHOW (NO genera ingreso)
 // ---------------------------------------------------------------------
-export async function stylistConfirm(req: Request, res: Response, next: NextFunction) {
-  try {
-    const user = req.user!;
-    const id = req.params.id;
-
-    const booking = await BookingModel.findById(id);
-    if (!booking) throw new ApiError(StatusCodes.NOT_FOUND, 'No existe');
-
-    if (user.role !== ROLES.ESTILISTA || booking.estilistaId.toString() !== user.id) {
-      throw new ApiError(StatusCodes.FORBIDDEN, 'No autorizado');
-    }
-
-    const now = new Date();
-    const startPlus10 = new Date(booking.inicio.getTime() + 10 * 60 * 1000);
-
-    if (now > startPlus10) {
-      booking.estado = booking.estado === BOOKING_STATUS.CONFIRMED
-        ? BOOKING_STATUS.CONFIRMED
-        : BOOKING_STATUS.NO_SHOW;
-    } else {
-      booking.estado = BOOKING_STATUS.CONFIRMED;
-    }
-
-    booking.actualizadoPor = user.id as any;
-    await booking.save();
-
-    res.json(booking);
-  } catch (err) { next(err); }
-}
-
 export async function stylistComplete(req: Request, res: Response, next: NextFunction) {
   try {
     const user = req.user!;
     const id = req.params.id;
-    const { precio, notas } = req.body;
+
+    const { clienteAsistio, precio, notas } = req.body as {
+      clienteAsistio: boolean;
+      precio?: number;
+      notas?: string;
+    };
+
+    if (typeof clienteAsistio !== 'boolean') {
+      throw new ApiError(StatusCodes.BAD_REQUEST, 'Debes enviar clienteAsistio: true/false');
+    }
 
     const booking = await BookingModel.findById(id);
     if (!booking) throw new ApiError(StatusCodes.NOT_FOUND, 'No existe');
@@ -517,12 +491,24 @@ export async function stylistComplete(req: Request, res: Response, next: NextFun
       throw new ApiError(StatusCodes.FORBIDDEN, 'No autorizado');
     }
 
-    booking.estado = BOOKING_STATUS.COMPLETED;
-    if (precio !== undefined) booking.precio = Number(precio);
-    if (notas) booking.notas = (booking.notas ?? '') + `\nFINALIZADO: ${notas}`;
-    booking.actualizadoPor = user.id as any;
+    booking.clienteAsistio = clienteAsistio;
 
+    if (clienteAsistio) {
+      booking.estado = BOOKING_STATUS.COMPLETED;
+      if (precio !== undefined) booking.precio = Number(precio);
+    } else {
+      booking.estado = BOOKING_STATUS.NO_SHOW;
+      booking.precio = undefined as any; // sin ingreso
+    }
+
+    if (notas) {
+      const tag = clienteAsistio ? 'FINALIZADO' : 'NO_SHOW';
+      booking.notas = (booking.notas ?? '') + `\n${tag}: ${notas}`;
+    }
+
+    booking.actualizadoPor = user.id as any;
     await booking.save();
+
     res.json(booking);
   } catch (err) { next(err); }
 }

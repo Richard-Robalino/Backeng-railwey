@@ -24,14 +24,21 @@ app.use(mongoSanitize());
 
 // CORS
 const origins = env.CLIENT_ORIGINS.split(',').map(o => o.trim());
+
 app.use(cors({
-  origin: function(origin, callback) {
+  origin: function (origin, callback) {
+    // Permitir peticiones sin origin (Postman, curl)
     if (!origin) return callback(null, true);
-    if (origins.indexOf(origin) !== -1) callback(null, true);
-    else callback(new Error('CORS not allowed'));
+
+    if (origins.includes(origin)) return callback(null, true);
+
+    return callback(new Error('CORS not allowed'), false);
   },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
 }));
+
 
 // Logging
 if (env.NODE_ENV !== 'test') {

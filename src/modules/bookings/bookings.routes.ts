@@ -4,7 +4,7 @@ import { requireRoles } from '../../middlewares/requireRole.js';
 import { ROLES } from '../../constants/roles.js';
 import { validateBody, validateQuery } from '../../middlewares/validate.js';
 import { availabilityQuerySchema, cancelSchema, createBookingSchema, rescheduleSchema } from './bookings.schemas.js';
-import { cancelBooking, createBooking, getAvailability, rescheduleBooking, stylistComplete, stylistConfirm } from './bookings.controller.js';
+import { cancelBooking, createBooking, getAvailability, rescheduleBooking, stylistComplete } from './bookings.controller.js';
 
 import {
   listAllBookings,
@@ -24,9 +24,7 @@ router.use(authenticate);
 router.post('/', requireRoles(ROLES.CLIENTE, ROLES.ADMIN, ROLES.GERENTE), validateBody(createBookingSchema), createBooking);
 router.put('/:id/reschedule', validateBody(rescheduleSchema), rescheduleBooking);
 router.post('/:id/cancel', validateBody(cancelSchema), cancelBooking);
-
-router.post('/:id/confirm', requireRoles(ROLES.ESTILISTA), stylistConfirm);
-router.post('/:id/complete', requireRoles(ROLES.ESTILISTA), stylistComplete);
+router.patch('/:id/complete', requireRoles(ROLES.ESTILISTA), stylistComplete);
 
 
 
