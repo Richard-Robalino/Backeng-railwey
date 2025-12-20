@@ -5,7 +5,7 @@ import { authenticate } from '../../middlewares/auth.js';
 import { validateBody } from '../../middlewares/validate.js';
 import { createUser, deleteUser, getUser, listUsers, updateOwnProfile, updateUser, getOwnProfile ,sendVerificationEmail, resendVerification, verifyEmailLink, verifyEmailJSON } from './admin.controller.js';
 import { createUserSchema, updateUserSchema, updateProfileSchema,sendVerificationSchema, resendVerificationSchema, verifyEmailSchema } from './user.schemas.js';
-import { setUserActiveStatus, activateUser, deactivateUser } from './admin.controller.js';
+import { setUserActiveStatus, activateUser, deactivateUser, updateProfileById } from './admin.controller.js';
 import { updateUserStatusSchema } from './user.schemas.js';
 const router = Router();
 
@@ -20,6 +20,14 @@ router.get('/', requireRoles(ROLES.ADMIN), listUsers);
 router.get('/:id', requireRoles(ROLES.ADMIN), getUser);
 router.put('/:id', requireRoles(ROLES.ADMIN, ROLES.GERENTE), validateBody(updateUserSchema), updateUser);
 router.delete('/:id', requireRoles(ROLES.ADMIN), deleteUser);
+
+
+router.put(
+  '/:id/profile',
+  requireRoles(ROLES.ADMIN, ROLES.GERENTE),
+  validateBody(updateProfileSchema),
+  updateProfileById
+);
 
 // Enviar verificación manual (sin login)
 

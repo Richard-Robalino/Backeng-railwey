@@ -217,3 +217,53 @@ export async function deactivateUser(req: Request, res: Response, next: NextFunc
   (req as any).body = { isActive: false };
   return setUserActiveStatus(req, res, next);
 }
+
+function setIfDefined(obj: any, key: string, val: any) {
+  if (val !== undefined) obj[key] = val;
+}
+
+export async function updateProfileById(req: Request, res: Response, next: NextFunction) {
+  try {
+    const targetId = req.params.id;
+
+    const targetUser = await UserModel.findById(targetId);
+    if (!targetUser) throw new ApiError(StatusCodes.NOT_FOUND, 'Usuario no encontrado');
+
+    // ✅ (Recomendado) GERENTE no puede editar ADMIN
+    if (req.user?.role === ROLES.GERENTE && targetUser.role === ROLES.ADMIN) {
+      throw new ApiError(StatusCodes.FORBIDDEN, 'GERENTE no puede modificar a un ADMIN');
+    }
+
+    const { nombre, apellido, cedula, telefono, genero, edad, password } = req.body;
+
+    // ✅ Si cambias cédula, validar que no se repita
+    if (cedula && cedula !== targetUser.cedula) {
+      const cedExists = await UserModel.exists({ cedula, _id: { $ne: targetUser._id } });
+      if (cedExists) throw new ApiError(StatusCodes.CONFLICT, 'Cédula ya registrada');
+    }
+
+    const updates: any = {};
+    setIfDefined(updates, 'nombre', nombre);
+    setIfDefined(updates, 'apellido', apellido);
+    setIfDefined(updates, 'cedula', cedula);
+    setIfDefined(updates, 'telefono', telefono);
+    setIfDefined(updates, 'genero', genero);
+    setIfDefined(updates, 'edad', edad);
+
+    if (password) updates.password = await hashPassword(password);
+
+    if (Object.keys(updates).length === 0) {
+      throw new ApiError(StatusCodes.BAD_REQUEST, 'No hay campos para actualizar');
+    }
+
+    Object.assign(targetUser, updates);
+    await targetUser.save();
+
+    const plain = targetUser.toObject();
+    delete (plain as any).password;
+
+    res.status(StatusCodes.OK).json(plain);
+  } catch (err) {
+    next(err);
+  }
+}
