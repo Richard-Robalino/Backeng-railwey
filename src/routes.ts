@@ -13,6 +13,7 @@ import catalogRoutes from './modules/catalog/catalog.routes.js';
 import appointmentRoutes from './modules/appointments/appointments.routes.js';
 import slotRoutes from './modules/slots/slots.routes.js';
 import paymentRoutes from './modules/payments/payments.routes.js';
+
 const router = Router();
 
 router.use(healthRoutes);
@@ -29,5 +30,6 @@ router.use('/catalog', catalogRoutes);
 router.use('/appointments', appointmentRoutes);
 router.use('/slots', slotRoutes);
 router.use('/payments', paymentRoutes);
+
 
 export default router;

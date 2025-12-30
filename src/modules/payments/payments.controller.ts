@@ -494,9 +494,11 @@ export async function listMyTransferProofs(req: Request, res: Response, next: Ne
 }
 
 // ======================================================
-// 2) CONFIRMAR TRANSFERENCIA (ADMIN/GERENTE)
+// 2) CONFIRMAR TRANSFERENCIA (ADMIN/GERENTE) - SOLO 1 VEZ
 // ======================================================
 export async function confirmTransferPayment(req: Request, res: Response, next: NextFunction) {
+  const session = await mongoose.startSession();
+
   try {
     const user = req.user!;
     const bookingId = req.params.id;
@@ -513,63 +515,108 @@ export async function confirmTransferPayment(req: Request, res: Response, next: 
       );
     }
 
-    const booking = await BookingModel.findById(bookingId);
-    if (!booking) throw new ApiError(StatusCodes.NOT_FOUND, 'Reserva no encontrada');
+    let updatedBooking: any = null;
+    let updatedPayment: any = null;
+    let serviceSnapshot: any = null;
 
-    const payment = await PaymentModel.findOne({
-      bookingId: booking._id,
-      method: 'TRANSFER_PICHINCHA',
-      status: 'PENDING'
+    await session.withTransaction(async () => {
+      const booking = await BookingModel.findById(bookingId).session(session);
+      if (!booking) throw new ApiError(StatusCodes.NOT_FOUND, 'Reserva no encontrada');
+
+      // ✅ SOLO UNA VEZ: si ya está pagada/confirmada, bloquear
+      if (booking.paymentStatus === 'PAID' || booking.paidAt || booking.invoiceNumber) {
+        throw new ApiError(StatusCodes.CONFLICT, 'Esta reserva ya fue confirmada anteriormente');
+      }
+
+      // (opcional) bloquear confirmación si la reserva no es válida
+      if (
+        booking.estado === BOOKING_STATUS.CANCELLED ||
+        booking.estado === BOOKING_STATUS.NO_SHOW
+      ) {
+        throw new ApiError(
+          StatusCodes.BAD_REQUEST,
+          'No se puede confirmar transferencia para una reserva cancelada o no-show'
+        );
+      }
+
+      const service = await ServiceModel.findById(booking.servicioId).lean().session(session);
+      if (!service || !service.precio) {
+        throw new ApiError(StatusCodes.BAD_REQUEST, 'Servicio inválido o sin precio');
+      }
+      serviceSnapshot = service;
+
+      const amount = Number(service.precio);
+      const invoiceNumber = generateInvoiceNumber(booking.id);
+      const paidAt = new Date();
+
+      // ✅ ATÓMICO: solo pasa de PENDING -> PAID si existe comprobante
+      updatedPayment = await PaymentModel.findOneAndUpdate(
+        {
+          bookingId: booking._id,
+          method: 'TRANSFER_PICHINCHA',
+          status: 'PENDING',
+          transferProofUrl: { $exists: true, $ne: null }
+        },
+        {
+          $set: {
+            status: 'PAID',
+            amount
+          }
+        },
+        { new: true, session }
+      );
+
+      if (!updatedPayment) {
+        // Puede ser: no hay PENDING, falta comprobante, o ya fue confirmado antes
+        throw new ApiError(
+          StatusCodes.CONFLICT,
+          'No se puede confirmar: no existe un pago PENDING con comprobante (o ya fue confirmado)'
+        );
+      }
+
+      // ✅ ATÓMICO: solo marca booking como PAID si aún no lo está (doble click / carrera)
+      updatedBooking = await BookingModel.findOneAndUpdate(
+        {
+          _id: booking._id,
+          paymentStatus: { $ne: 'PAID' },
+          $or: [{ invoiceNumber: { $exists: false } }, { invoiceNumber: null }]
+        },
+        {
+          $set: {
+            precio: amount,
+            paymentStatus: 'PAID',
+            paymentMethod: 'TRANSFER_PICHINCHA',
+            paidAt,
+            invoiceNumber,
+            estado: BOOKING_STATUS.CONFIRMED,
+            actualizadoPor: new mongoose.Types.ObjectId(user.id)
+          }
+        },
+        { new: true, session }
+      );
+
+      if (!updatedBooking) {
+        throw new ApiError(StatusCodes.CONFLICT, 'Esta reserva ya fue confirmada por otro usuario');
+      }
     });
 
-    if (!payment) {
-      throw new ApiError(
-        StatusCodes.BAD_REQUEST,
-        'No hay pago pendiente por transferencia para esta reserva'
-      );
-    }
-
-    if (!payment.transferProofUrl) {
-      throw new ApiError(
-        StatusCodes.BAD_REQUEST,
-        'No se puede confirmar: falta comprobante de transferencia'
-      );
-    }
-
-    const service = await ServiceModel.findById(booking.servicioId).lean();
-    if (!service || !service.precio) {
-      throw new ApiError(StatusCodes.BAD_REQUEST, 'Servicio inválido o sin precio');
-    }
-
-    const amount = Number(service.precio);
-    const invoiceNumber = generateInvoiceNumber(booking.id);
-    const paidAt = new Date();
-
-    payment.status = 'PAID';
-    payment.amount = amount;
-    await payment.save();
-
-    booking.precio = amount;
-    booking.paymentStatus = 'PAID';
-    booking.paymentMethod = 'TRANSFER_PICHINCHA';
-    booking.paidAt = paidAt;
-    booking.invoiceNumber = invoiceNumber;
-    booking.estado = BOOKING_STATUS.CONFIRMED;
-    booking.actualizadoPor = new mongoose.Types.ObjectId(user.id);
-    await booking.save();
-
+    // 📩 Fuera de la transacción: PDF + correo (evita enviar 2 veces si algo falla dentro)
     const [client, stylist] = await Promise.all([
-      UserModel.findById(booking.clienteId).select('nombre apellido email'),
-      UserModel.findById(booking.estilistaId).select('nombre apellido email')
+      UserModel.findById(updatedBooking.clienteId).select('nombre apellido email'),
+      UserModel.findById(updatedBooking.estilistaId).select('nombre apellido email')
     ]);
 
+    const amount = Number(updatedBooking.precio);
+    const invoiceNumber = String(updatedBooking.invoiceNumber);
+    const paidAt = updatedBooking.paidAt as Date;
+
     const pdfBuffer = await generateInvoicePdf({
-      booking,
+      booking: updatedBooking,
       client: client || null,
       stylist: stylist || null,
       service: {
-        nombre: service.nombre,
-        duracionMin: service.duracionMin,
+        nombre: serviceSnapshot?.nombre,
+        duracionMin: serviceSnapshot?.duracionMin,
         precio: amount
       },
       payment: {
@@ -583,8 +630,8 @@ export async function confirmTransferPayment(req: Request, res: Response, next: 
     if (client?.email) {
       const htmlCliente = `
         <p>Tu pago por transferencia ha sido <b>confirmado</b>.</p>
-        <p><b>Servicio:</b> ${service.nombre}</p>
-        <p><b>Fecha y hora:</b> ${formatEC(booking.inicio)}</p>
+        <p><b>Servicio:</b> ${serviceSnapshot?.nombre}</p>
+        <p><b>Fecha y hora:</b> ${formatEC(updatedBooking.inicio)}</p>
         <p><b>Total pagado:</b> $${amount.toFixed(2)}</p>
         <p><b>Factura:</b> ${invoiceNumber}</p>
         <p>Adjuntamos tu factura en PDF.</p>
@@ -601,12 +648,14 @@ export async function confirmTransferPayment(req: Request, res: Response, next: 
 
     res.json({
       message: 'Transferencia confirmada, pago registrado y cita confirmada',
-      bookingId: booking.id,
-      paymentId: payment.id,
+      bookingId: updatedBooking.id,
+      paymentId: updatedPayment.id,
       invoiceNumber,
-      transferProofUrl: payment.transferProofUrl
+      transferProofUrl: updatedPayment.transferProofUrl
     });
   } catch (err) {
     next(err);
+  } finally {
+    session.endSession();
   }
 }
