@@ -99,7 +99,7 @@ export async function getAvailability(req: Request, res: Response, next: NextFun
 }
 
 // ---------------------------------------------------------------------
-// CREAR RESERVA (1 o varios slots)  -> estado: CONFIRMED
+// CREAR RESERVA (1 o varios slots)  -> estado: PENDING_STYLIST_CONFIRMATION
 // ---------------------------------------------------------------------
 export async function createBooking(req: Request, res: Response, next: NextFunction) {
   try {
@@ -257,7 +257,7 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
       }
     }
 
-    // 8) Crear todas las reservas -> CONFIRMED + clienteAsistio null
+    // 8) Crear todas las reservas -> PENDING_STYLIST_CONFIRMATION + clienteAsistio null
     const created: any[] = [];
     for (const c of candidates) {
       const booking = await BookingModel.create({
@@ -267,7 +267,8 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
         inicio: c.start,
         fin: c.end,
 
-        estado: BOOKING_STATUS.CONFIRMED, // ✅ CAMBIO AQUÍ
+        // ✅ AHORA queda pendiente de confirmación del estilista
+        estado: BOOKING_STATUS.PENDING_STYLIST_CONFIRMATION,
         clienteAsistio: null,
 
         notas,
@@ -287,13 +288,14 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
       const stylistUser = await UserModel.findById(c.slot.stylist._id);
       if (stylistUser?.email) {
         const bodyStylist =
-          `Tienes una nueva reserva.\n\n` +
+          `Tienes una nueva reserva PENDIENTE de confirmación.\n\n` +
           `Cliente: ${clientNombre}\n` +
           `Servicio: ${servicioTexto}\n` +
           `Fecha y hora: ${fechaTexto}\n\n` +
-          `Notas: ${notas || 'Sin notas adicionales.'}`;
+          `Notas: ${notas || 'Sin notas adicionales.'}\n\n` +
+          `Acción requerida: confirma o cancela desde tu panel.`;
 
-        await sendEmail(stylistUser.email, 'Nueva reserva', bodyStylist);
+        await sendEmail(stylistUser.email, 'Reserva pendiente de confirmación', bodyStylist);
       }
 
       if (client?.email) {
@@ -303,13 +305,13 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
             : 'Tu estilista';
 
         const bodyClient =
-          `Tu reserva ha sido registrada.\n\n` +
+          `Tu reserva ha sido registrada y está PENDIENTE de confirmación del estilista.\n\n` +
           `Estilista: ${stylistNombre}\n` +
           `Servicio: ${servicioTexto}\n` +
           `Fecha y hora: ${fechaTexto}\n\n` +
           `Notas: ${notas || 'Sin notas adicionales.'}`;
 
-        await sendEmail(client.email, 'Reserva confirmada', bodyClient);
+        await sendEmail(client.email, 'Reserva registrada (pendiente)', bodyClient);
       }
     }
 
@@ -322,7 +324,55 @@ export async function createBooking(req: Request, res: Response, next: NextFunct
 }
 
 // ---------------------------------------------------------------------
-// REPROGRAMAR RESERVA -> estado: CONFIRMED (sin confirmación del estilista)
+// CONFIRMAR RESERVA (ESTILISTA) -> PENDING_STYLIST_CONFIRMATION -> CONFIRMED
+// ---------------------------------------------------------------------
+export async function stylistConfirmBooking(req: Request, res: Response, next: NextFunction) {
+  try {
+    const user = req.user!;
+    const id = req.params.id;
+
+    const booking = await BookingModel.findById(id);
+    if (!booking) throw new ApiError(StatusCodes.NOT_FOUND, 'No existe');
+
+    if (user.role !== ROLES.ESTILISTA || booking.estilistaId.toString() !== user.id) {
+      throw new ApiError(StatusCodes.FORBIDDEN, 'No autorizado');
+    }
+
+    if (booking.estado !== BOOKING_STATUS.PENDING_STYLIST_CONFIRMATION) {
+      throw new ApiError(StatusCodes.BAD_REQUEST, 'La reserva no está pendiente de confirmación');
+    }
+
+    // Si ya inició, no se confirma (se auto-cancelará por job)
+    const now = new Date();
+    if (now >= booking.inicio) {
+      throw new ApiError(StatusCodes.BAD_REQUEST, 'No puedes confirmar una cita que ya inició');
+    }
+
+    booking.estado = BOOKING_STATUS.CONFIRMED;
+    booking.actualizadoPor = user.id as any;
+    await booking.save();
+
+    // Email al cliente
+    if (booking.clienteId) {
+      const clientUser = await UserModel.findById(booking.clienteId).select('email nombre apellido');
+      if (clientUser?.email) {
+        const fechaTexto = formatEC(booking.inicio);
+        const bodyClient =
+          `Tu reserva ha sido CONFIRMADA por el estilista.\n\n` +
+          `Fecha y hora: ${fechaTexto}\n` +
+          `ID de reserva: ${booking.id}`;
+
+        await sendEmail(clientUser.email, 'Reserva confirmada', bodyClient);
+      }
+    }
+
+    res.json(booking);
+  } catch (err) { next(err); }
+}
+
+// ---------------------------------------------------------------------
+// REPROGRAMAR RESERVA -> queda PENDIENTE de confirmación del estilista
+// (Mantiene compatibilidad: acepta "inicio" o acepta "slotId"+"date")
 // ---------------------------------------------------------------------
 export async function rescheduleBooking(req: Request, res: Response, next: NextFunction) {
   try {
@@ -342,9 +392,49 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
       );
     }
 
-    const start = parseDateTime(req.body.inicio);
-    if (isNaN(start.getTime())) {
-      throw new ApiError(StatusCodes.BAD_REQUEST, 'Fecha de inicio inválida');
+    // ✅ 1) Soporta inicio directo (compatibilidad)
+    let start: Date | null = null;
+    if (req.body?.inicio) {
+      start = parseDateTime(req.body.inicio);
+      if (isNaN(start.getTime())) {
+        throw new ApiError(StatusCodes.BAD_REQUEST, 'Fecha de inicio inválida');
+      }
+    }
+
+    // ✅ 2) Soporta slotId + date (lo que ya validas en Joi)
+    if (!start && req.body?.slotId && req.body?.date) {
+      const slot = await ServiceSlotModel.findById(req.body.slotId)
+        .populate('stylist', '_id role isActive')
+        .populate('service', '_id activo duracionMin');
+
+      if (!slot || slot.isActive === false) {
+        throw new ApiError(StatusCodes.BAD_REQUEST, 'Horario no existe o está inactivo');
+      }
+
+      // Mantener lógica: no cambiar estilista/servicio de la reserva en reprogramación
+      const slotStylistId = (slot as any).stylist?._id?.toString();
+      const slotServiceId = (slot as any).service?._id?.toString();
+
+      if (!slotStylistId || slotStylistId !== booking.estilistaId.toString()) {
+        throw new ApiError(StatusCodes.BAD_REQUEST, 'El horario no pertenece al estilista de esta reserva');
+      }
+      if (!slotServiceId || slotServiceId !== booking.servicioId.toString()) {
+        throw new ApiError(StatusCodes.BAD_REQUEST, 'El horario no corresponde al servicio de esta reserva');
+      }
+
+      const dayLabel = getDayLabelEC(req.body.date);
+      if (dayLabel !== (slot as any).dayOfWeek) {
+        throw new ApiError(
+          StatusCodes.BAD_REQUEST,
+          `La fecha no coincide con el día configurado del horario (${(slot as any).dayOfWeek})`
+        );
+      }
+
+      start = buildDateTimeForSlot(req.body.date, (slot as any).startMin);
+    }
+
+    if (!start) {
+      throw new ApiError(StatusCodes.BAD_REQUEST, 'Debes enviar inicio o (slotId y date)');
     }
 
     const service = await ServiceModel.findById(booking.servicioId);
@@ -386,7 +476,8 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
     booking.inicio = start;
     booking.fin = end;
 
-    booking.estado = BOOKING_STATUS.CONFIRMED; // ✅ CAMBIO AQUÍ
+    // ✅ Vuelve a quedar pendiente del estilista
+    booking.estado = BOOKING_STATUS.PENDING_STYLIST_CONFIRMATION;
     booking.clienteAsistio = null;
 
     booking.actualizadoPor = user.id as any;
@@ -399,12 +490,12 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
     const stylistUser = await UserModel.findById(booking.estilistaId).select('email nombre apellido');
     if (stylistUser?.email) {
       const bodyStylist =
-        `Una reserva ha sido reprogramada.\n\n` +
+        `Una reserva ha sido REPROGRAMADA y requiere tu confirmación.\n\n` +
         `Servicio: ${servicioTexto}\n` +
         `Nueva fecha y hora: ${fechaTexto}\n\n` +
         `ID de reserva: ${booking.id}`;
 
-      await sendEmail(stylistUser.email, 'Reserva reprogramada', bodyStylist);
+      await sendEmail(stylistUser.email, 'Reserva reprogramada (pendiente)', bodyStylist);
     }
 
     if (booking.clienteId) {
@@ -416,13 +507,13 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
             : 'Tu estilista';
 
         const bodyClient =
-          `Tu reserva ha sido reprogramada.\n\n` +
+          `Tu reserva ha sido reprogramada y está PENDIENTE de confirmación del estilista.\n\n` +
           `Estilista: ${stylistNombre}\n` +
           `Servicio: ${servicioTexto}\n` +
           `Nueva fecha y hora: ${fechaTexto}\n\n` +
           `ID de reserva: ${booking.id}`;
 
-        await sendEmail(clientUser.email, 'Tu reserva ha sido reprogramada', bodyClient);
+        await sendEmail(clientUser.email, 'Reserva reprogramada (pendiente)', bodyClient);
       }
     }
 
@@ -431,7 +522,10 @@ export async function rescheduleBooking(req: Request, res: Response, next: NextF
 }
 
 // ---------------------------------------------------------------------
-// CANCELAR RESERVA
+// CANCELAR RESERVA (CLIENTE / ESTILISTA / ADMIN / GERENTE)
+// - Cliente: mantiene regla 12h + congelar 24h
+// - Estilista: puede cancelar SOLO sus propias citas
+// - Admin/Gerente: puede cancelar cualquier cita
 // ---------------------------------------------------------------------
 export async function cancelBooking(req: Request, res: Response, next: NextFunction) {
   try {
@@ -445,6 +539,7 @@ export async function cancelBooking(req: Request, res: Response, next: NextFunct
     const now = new Date();
     const diffHours = hoursUntil(now, booking.inicio);
 
+    // ✅ Autorización por rol
     if (user.role === ROLES.CLIENTE) {
       if (diffHours < 12) {
         await UserModel.findByIdAndUpdate(user.id, {
@@ -452,11 +547,47 @@ export async function cancelBooking(req: Request, res: Response, next: NextFunct
         });
         throw new ApiError(StatusCodes.FORBIDDEN, 'Cancelación fuera de plazo. Cuenta congelada 24h.');
       }
-      if (booking.clienteId.toString() !== user.id) throw new ApiError(StatusCodes.FORBIDDEN, 'No autorizado');
+      if (booking.clienteId.toString() !== user.id) {
+        throw new ApiError(StatusCodes.FORBIDDEN, 'No autorizado');
+      }
+
+      booking.estado = BOOKING_STATUS.CANCELLED;
+      booking.notas = (booking.notas ?? '') + `\nCANCELADO POR CLIENTE: ${motivo}`;
     }
 
-    booking.estado = BOOKING_STATUS.CANCELLED;
-    booking.notas = (booking.notas ?? '') + `\nCANCELADO: ${motivo}`;
+    else if (user.role === ROLES.ESTILISTA) {
+      if (booking.estilistaId.toString() !== user.id) {
+        throw new ApiError(StatusCodes.FORBIDDEN, 'No autorizado');
+      }
+
+      booking.estado = BOOKING_STATUS.CANCELLED;
+      booking.notas = (booking.notas ?? '') + `\nCANCELADO POR ESTILISTA: ${motivo}`;
+
+      // Email al cliente
+      if (booking.clienteId) {
+        const clientUser = await UserModel.findById(booking.clienteId).select('email');
+        if (clientUser?.email) {
+          const fechaTexto = formatEC(booking.inicio);
+          const bodyClient =
+            `Tu reserva fue CANCELADA por el estilista.\n\n` +
+            `Fecha y hora: ${fechaTexto}\n` +
+            `Motivo: ${motivo}\n` +
+            `ID de reserva: ${booking.id}`;
+
+          await sendEmail(clientUser.email, 'Reserva cancelada', bodyClient);
+        }
+      }
+    }
+
+    else if (user.role === ROLES.ADMIN || user.role === ROLES.GERENTE) {
+      booking.estado = BOOKING_STATUS.CANCELLED;
+      booking.notas = (booking.notas ?? '') + `\nCANCELADO POR ADMIN/GERENTE: ${motivo}`;
+    }
+
+    else {
+      throw new ApiError(StatusCodes.FORBIDDEN, 'No autorizado');
+    }
+
     booking.actualizadoPor = user.id as any;
     await booking.save();
 
@@ -489,6 +620,11 @@ export async function stylistComplete(req: Request, res: Response, next: NextFun
 
     if (user.role !== ROLES.ESTILISTA || booking.estilistaId.toString() !== user.id) {
       throw new ApiError(StatusCodes.FORBIDDEN, 'No autorizado');
+    }
+
+    // ✅ No permitir completar si el estilista no confirmó
+    if (booking.estado === BOOKING_STATUS.PENDING_STYLIST_CONFIRMATION) {
+      throw new ApiError(StatusCodes.BAD_REQUEST, 'Debes confirmar la cita antes de finalizarla');
     }
 
     booking.clienteAsistio = clienteAsistio;

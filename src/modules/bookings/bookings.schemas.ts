@@ -9,7 +9,7 @@ export const createBookingSchema = Joi.object({
   // ...o varios slots
   slotIds: Joi.array().items(objectId).min(1).optional(),
 
-  // Fecha del día (mismo formato que antes)
+  // Fecha del día
   date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required(),
 
   notas: Joi.string().max(200).allow('', null)
@@ -27,12 +27,24 @@ export const createBookingSchema = Joi.object({
     return value;
   }, 'slotId/slotIds validation');
 
-
+// ✅ Reprogramar: aceptar inicio (compat) o aceptar slotId+date
 export const rescheduleSchema = Joi.object({
-  // Reprogramar también elige un nuevo slot y fecha
-  slotId: objectId.required(),
-  date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required()
-});
+  // Forma A (compatibilidad)
+  inicio: Joi.string().optional(),
+
+  // Forma B (como lo tenías)
+  slotId: objectId.optional(),
+  date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional()
+})
+  .custom((value, helpers) => {
+    const hasInicio = !!value.inicio;
+    const hasSlotDate = !!value.slotId && !!value.date;
+
+    if (!hasInicio && !hasSlotDate) {
+      return helpers.error('any.custom', { message: 'Debes enviar inicio o (slotId y date)' });
+    }
+    return value;
+  }, 'reschedule validation');
 
 export const cancelSchema = Joi.object({
   motivo: Joi.string().max(100).required()
